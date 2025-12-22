@@ -12,17 +12,16 @@ import colors from "colors";
 import connectDb from "./config/db.js";
 import connectCloudinary from "./config/cloudinary.config.js";
 
-import User from "./models/user.model.js";
-
 import authRoutes from "./routes/auth.route.js";
 import userRoutes from "./routes/user.route.js";
-import friendRoutes from "./routes/friend.route.js";
-import matchRoutes from "./routes/match.route.js";
+import matchRoutesFactory from "./routes/match.route.js";
 import clubRoutes from "./routes/club.route.js";
 import bookingRoutes from "./routes/booking.route.js";
 import zegoRoutes from "./routes/zego.route.js";
+import friendRoutesFactory from "./routes/friend.route.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
+import registerPresenceHandlers from "./services/socket_handler/presenceHandler.js";
 
 dotenv.config();
 
@@ -37,7 +36,7 @@ app.use(express.urlencoded({ extended: true }));
 // CORS setup
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000", // Restrict origin to your frontend URL or localhost
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
     credentials: true,
   })
 );
@@ -48,21 +47,46 @@ app.use(morgan("dev"));
 // Rate limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200, // Limit requests to 200 per 15 minutes
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use(limiter);
 
-// Routes
+// ✅ Create HTTP server first
+const server = Http.createServer(app);
+
+// ✅ Create io + presence BEFORE using route factories
+const io = new Server(server, {
+  cors: {
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+  transports: ["websocket", "polling"],
+});
+
+// ✅ Presence map (single source of truth)
+const presence = new Map();
+
+// Routes (normal)
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
-app.use("/api/match", matchRoutes);
 app.use("/api/club", clubRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/zego", zegoRoutes);
 
-// Health check endpoint with additional logging
+// ✅ Routes that NEED io + presence (factories)
+app.use("/api/friend", friendRoutesFactory(io, presence));
+app.use("/api/match", matchRoutesFactory(io, presence));
+
+// User status endpoint
+app.get("/api/user/status/:id", (req, res) => {
+  const { id } = req.params;
+  res.json({ userId: String(id), online: presence.has(String(id)) });
+});
+
+// Health check
 app.get("/api/health", (req, res) => {
   console.log("Health check endpoint hit");
   res.status(200).json({
@@ -72,176 +96,29 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Error handling middleware
+// ✅ Socket.io connection handler
+io.on("connection", (socket) => {
+  console.log(`Socket connected: ${socket.id}`);
+
+  // Presence system (emits presence:update + nearbyPlayers)
+  registerPresenceHandlers(io, socket, presence);
+
+  // Match socket handlers (if you use any socket-only match flows)
+  registerMatchHandlers(io, socket, presence);
+
+  socket.on("disconnect", () => {
+    console.log(`Socket disconnected: ${socket.id}`);
+    // presenceHandler already handles cleanup + emits presence:update
+  });
+});
+
+// Error handling middleware (keep after routes)
 app.use((err, req, res, next) => {
   console.error("Server Error:", err.stack);
   res.status(500).json({
     success: false,
     message: "Internal Server Error",
     error: err.message,
-  });
-});
-
-// Server and Socket.io setup
-const server = Http.createServer(app);
-
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    methods: ["GET", "POST"],
-  },
-});
-
-// Presence map for online players
-const presence = new Map();
-
-// Routes
-app.use("/api/friend", friendRoutes(io, presence));
-
-// User status endpoint
-app.get("/api/user/status/:id", (req, res) => {
-  const { id } = req.params;
-  res.json({ userId: String(id), online: presence.has(String(id)) });
-});
-
-// Emit online players to connected clients
-async function emitOnlinePlayers() {
-  const ids = Array.from(presence.keys());
-  if (ids.length === 0) {
-    io.emit("presence:update", []);
-    return;
-  }
-
-  const users = await User.find({ _id: { $in: ids } })
-    .select("profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag")
-    .lean();
-
-  io.emit("presence:update", users); // Emit the list of online players
-}
-
-// Get nearby players based on the user's location
-async function getNearbyPlayersForUser(userId, radiusKm = 5) {
-  const me = await User.findById(userId).select("location profile.latitude profile.longitude").lean();
-  if (!me) return [];
-
-  const coords = me.location?.coordinates;
-  if (!coords || coords.length !== 2) return [];
-
-  const lng = coords[0];
-  const lat = coords[1];
-
-  const nearby = await User.find({
-    _id: { $ne: userId },
-    "profile.onlineStatus": true,
-    location: {
-      $near: {
-        $geometry: { type: "Point", coordinates: [lng, lat] },
-        $maxDistance: radiusKm * 1000,
-      },
-    },
-  })
-    .select("profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag location")
-    .lean();
-
-  return nearby;
-}
-
-// Socket.io connection handler
-io.on("connection", (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
-
-  registerMatchHandlers(io, socket, presence);
-
-  const setPresence = async (userId) => {
-    const uid = String(userId || "");
-    if (!uid) return;
-
-    socket.userId = uid;
-    presence.set(uid, socket.id);
-
-    try {
-      await User.findByIdAndUpdate(uid, {
-        "profile.onlineStatus": true,
-        lastSeen: new Date(),
-      });
-      await emitOnlinePlayers(); // Emit online players when a new user is online
-    } catch (err) {
-      console.error("Error setting presence:", err);
-    }
-  };
-
-  socket.on("userOnline", async (userId) => {
-    await setPresence(userId);
-  });
-
-  socket.on("player:online", async (payload) => {
-    if (!payload || !payload.userId || !payload.location) return;
-
-    const { userId, location } = payload;
-    const lat = location.lat;
-    const lng = location.lng;
-
-    const update = {
-      "profile.onlineStatus": true,
-      lastSeen: new Date(),
-      location: { type: "Point", coordinates: [lng, lat] },
-      "profile.latitude": lat,
-      "profile.longitude": lng,
-    };
-
-    try {
-      await User.findByIdAndUpdate(userId, update);
-      await emitOnlinePlayers(); // Emit updated players list
-
-      if (typeof lat === "number" && typeof lng === "number") {
-        const nearby = await getNearbyPlayersForUser(userId, 5);
-        socket.emit("nearbyPlayers", nearby); // Send nearby players to the user
-      }
-    } catch (err) {
-      console.error("Error updating player location:", err);
-    }
-  });
-
-  socket.on("updateLocation", async (payload) => {
-    if (!payload || !payload.userId || typeof payload.lat !== "number" || typeof payload.lng !== "number") {
-      console.error("Invalid location update payload:", payload);
-      return;
-    }
-
-    const { userId, lat, lng } = payload;
-    try {
-      await User.findByIdAndUpdate(userId, {
-        location: { type: "Point", coordinates: [lng, lat] },
-        "profile.latitude": lat,
-        "profile.longitude": lng,
-        lastSeen: new Date(),
-      });
-
-      const nearby = await getNearbyPlayersForUser(userId, 5);
-      socket.emit("nearbyPlayers", nearby); // Send nearby players to the user
-    } catch (err) {
-      console.error("Error updating location:", err);
-    }
-  });
-
-  socket.on("disconnect", async () => {
-    const uid = socket.userId ? String(socket.userId) : "";
-    if (uid) {
-      presence.delete(uid);
-
-      try {
-        await User.findByIdAndUpdate(uid, {
-          "profile.onlineStatus": false,
-          lastSeen: new Date(),
-        });
-        await emitOnlinePlayers(); // Emit updated players list after a user disconnects
-        console.log(`User offline: ${uid}`);
-      } catch (err) {
-        console.error("Error updating user status on disconnect:", err);
-      }
-    }
-
-    console.log(`Socket disconnected: ${socket.id}`);
   });
 });
 
