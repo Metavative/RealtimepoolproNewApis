@@ -1,14 +1,16 @@
 import mongoose from "mongoose";
 
+// Feedback schema for user feedback
 const FeedbackSchema = new mongoose.Schema({
-  avatar: String,
+  avatar: { type: String, default: "" },
   name: String,
   feedback: String,
   createdAt: { type: Date, default: Date.now },
 });
 
+// Profile schema to handle user profile data
 const ProfileSchema = new mongoose.Schema({
-  nickname: String,
+  nickname: { type: String, required: true },
   avatar: { type: String, default: "" },
   highestLevelAchieve: String,
   musicPlayer: { type: Boolean, default: true },
@@ -30,6 +32,7 @@ const ProfileSchema = new mongoose.Schema({
   longitude: { type: Number, default: null },
 });
 
+// Earnings schema to handle user earnings and balances
 const EarningsSchema = new mongoose.Schema({
   yearToDate: [Number],
   career: { type: Number, default: 0 },
@@ -40,6 +43,7 @@ const EarningsSchema = new mongoose.Schema({
   transactionHistory: [{ type: mongoose.Schema.Types.ObjectId, ref: "Transaction" }],
 });
 
+// Stats schema to handle user statistics
 const StatsSchema = new mongoose.Schema({
   userIdTag: { type: String, unique: true, sparse: true },
   rank: { type: String, default: "Beginner" },
@@ -56,39 +60,36 @@ const StatsSchema = new mongoose.Schema({
   disputeHistoryCount: { type: Number, default: 0 },
 });
 
+// User schema to handle the main user data
 const UserSchema = new mongoose.Schema({
   email: { type: String, index: true, unique: true, sparse: true },
   phone: { type: String, index: true, unique: true, sparse: true },
-
   passwordHash: { type: String, select: false },
-
   clerkId: { type: String, index: true, unique: true, sparse: true },
   googleId: { type: String, index: true, unique: true, sparse: true },
   facebookId: { type: String, index: true, unique: true, sparse: true },
   appleId: { type: String, index: true, unique: true, sparse: true },
-
   profile: ProfileSchema,
   feedbacks: [FeedbackSchema],
   earnings: EarningsSchema,
   stats: StatsSchema,
   friends: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   createdAt: { type: Date, default: Date.now },
-
   otp: {
     code: String,
     expiresAt: Date,
   },
-
   location: {
     type: { type: String, enum: ["Point"], default: "Point" },
     coordinates: { type: [Number], default: [0, 0] },
   },
-
   lastSeen: { type: Date, default: Date.now },
 });
 
+// Create 2dsphere index for location data to support geospatial queries
 UserSchema.index({ location: "2dsphere" });
 
+// Pre-save hook to handle avatar assignment based on the nickname
 UserSchema.pre("save", function (next) {
   if (this.profile) {
     if (!this.profile.avatar || this.profile.avatar === "") {
@@ -102,4 +103,5 @@ UserSchema.pre("save", function (next) {
   next();
 });
 
+// Export the User model
 export default mongoose.model("User", UserSchema);

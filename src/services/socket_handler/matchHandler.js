@@ -1,5 +1,3 @@
-// services/socket_handler/matchHandler.js
-
 function getSocketIdFromPresence(presence, userId) {
   if (!presence) return null;
   if (!userId) return null;
@@ -7,7 +5,7 @@ function getSocketIdFromPresence(presence, userId) {
 }
 
 /**
- * Match challenge real time events
+ * Match challenge real-time events
  * @param {import("socket.io").Server} io
  * @param {import("socket.io").Socket} socket
  * @param {Map<string,string>} presence
@@ -16,15 +14,20 @@ export default function registerMatchHandlers(io, socket, presence) {
   // 1) challenge sent (server forwards to opponent)
   socket.on("match:challenge_sent", async (payload) => {
     try {
-      const opponentId = payload?.opponentId;
-      const matchId = payload?.matchId;
-      const entryFee = payload?.entryFee;
-      const challengerInfo = payload?.challengerInfo;
+      const { opponentId, matchId, entryFee, challengerInfo } = payload;
 
-      if (!opponentId || !matchId) return;
+      if (!opponentId || !matchId) {
+        console.error("Invalid payload: missing opponentId or matchId".red);
+        return;
+      }
 
       const opponentSocketId = getSocketIdFromPresence(presence, opponentId);
-      if (!opponentSocketId) return;
+      if (!opponentSocketId) {
+        console.warn(`Opponent ${opponentId} not online, challenge cannot be sent.`.yellow);
+        return;
+      }
+
+      console.log(`Challenge sent from ${challengerInfo?.nickname} to ${opponentId}`.green);
 
       io.to(opponentSocketId).emit("match:challenge_received", {
         matchId,
@@ -40,13 +43,20 @@ export default function registerMatchHandlers(io, socket, presence) {
   // 2) challenge accepted (server forwards to challenger)
   socket.on("match:challenge_accepted", async (payload) => {
     try {
-      const challengerId = payload?.challengerId;
-      const matchId = payload?.matchId;
+      const { challengerId, matchId } = payload;
 
-      if (!challengerId || !matchId) return;
+      if (!challengerId || !matchId) {
+        console.error("Invalid payload: missing challengerId or matchId".red);
+        return;
+      }
 
       const challengerSocketId = getSocketIdFromPresence(presence, challengerId);
-      if (!challengerSocketId) return;
+      if (!challengerSocketId) {
+        console.warn(`Challenger ${challengerId} not online, cannot notify acceptance.`.yellow);
+        return;
+      }
+
+      console.log(`Challenge accepted for match ${matchId}, notifying ${challengerId}`.green);
 
       io.to(challengerSocketId).emit("match:started", {
         matchId,
@@ -60,24 +70,31 @@ export default function registerMatchHandlers(io, socket, presence) {
   // 3) match completed (server notifies both players)
   socket.on("match:completed_notification", async (payload) => {
     try {
-      const players = payload?.players;
-      const matchId = payload?.matchId;
-      const winnerId = payload?.winnerId;
+      const { players, matchId, winnerId } = payload;
 
-      if (!matchId) return;
-      if (!Array.isArray(players) || players.length === 0) return;
+      if (!matchId || !Array.isArray(players) || players.length === 0) {
+        console.error("Invalid payload: missing matchId or players array".red);
+        return;
+      }
+
+      console.log(`Match ${matchId} completed, notifying players.`.green);
 
       for (const userId of players) {
         const targetSocketId = getSocketIdFromPresence(presence, userId);
-        if (!targetSocketId) continue;
+        if (!targetSocketId) {
+          console.warn(`Player ${userId} not online, cannot send match result.`.yellow);
+          continue;
+        }
+
+        const message =
+          String(winnerId) === String(userId)
+            ? "Congratulations! You won the match."
+            : "You lost the match. Better luck next time.";
 
         io.to(targetSocketId).emit("match:result", {
           matchId,
           winnerId,
-          message:
-            String(winnerId) === String(userId)
-              ? "Congratulations! You won the match."
-              : "You lost the match. Better luck next time.",
+          message,
         });
       }
     } catch (error) {

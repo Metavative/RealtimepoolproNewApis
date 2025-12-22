@@ -1,5 +1,5 @@
 import User from "../models/user.model.js";
-import { verify } from "../services/jwtService.js";
+import { verifyAccessToken } from "../services/jwtService.js";
 
 export async function authMiddleware(req, res, next) {
   try {
@@ -15,13 +15,17 @@ export async function authMiddleware(req, res, next) {
     }
 
     const token = parts[1];
-    const payload = verify(token);
+    const payload = verifyAccessToken(token);
 
-    if (!payload || !payload.id) {
+    // ✅ Your authController signs: sign({ id: user._id })
+    // Keep fallback to sub if any other token uses it.
+    const userId = payload?.id || payload?.sub;
+
+    if (!userId) {
       return res.status(401).json({ message: "Invalid token payload" });
     }
 
-    const user = await User.findById(payload.id).select({ passwordHash: 0, otp: 0 });
+    const user = await User.findById(userId).select({ passwordHash: 0, otp: 0 });
     if (!user) {
       return res.status(401).json({ message: "User not found" });
     }

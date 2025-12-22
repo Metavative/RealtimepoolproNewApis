@@ -116,7 +116,7 @@ async function emitOnlinePlayers() {
     .select("profile.nickname profile.avatar profile.onlineStatus stats.rank stats.totalWinnings stats.userIdTag")
     .lean();
 
-  io.emit("presence:update", users);
+  io.emit("presence:update", users); // Emit the list of online players
 }
 
 // Get nearby players based on the user's location
@@ -164,7 +164,7 @@ io.on("connection", (socket) => {
         "profile.onlineStatus": true,
         lastSeen: new Date(),
       });
-      await emitOnlinePlayers();
+      await emitOnlinePlayers(); // Emit online players when a new user is online
     } catch (err) {
       console.error("Error setting presence:", err);
     }
@@ -191,11 +191,11 @@ io.on("connection", (socket) => {
 
     try {
       await User.findByIdAndUpdate(userId, update);
-      await emitOnlinePlayers();
+      await emitOnlinePlayers(); // Emit updated players list
 
       if (typeof lat === "number" && typeof lng === "number") {
         const nearby = await getNearbyPlayersForUser(userId, 5);
-        socket.emit("nearbyPlayers", nearby);
+        socket.emit("nearbyPlayers", nearby); // Send nearby players to the user
       }
     } catch (err) {
       console.error("Error updating player location:", err);
@@ -218,7 +218,7 @@ io.on("connection", (socket) => {
       });
 
       const nearby = await getNearbyPlayersForUser(userId, 5);
-      socket.emit("nearbyPlayers", nearby);
+      socket.emit("nearbyPlayers", nearby); // Send nearby players to the user
     } catch (err) {
       console.error("Error updating location:", err);
     }
@@ -234,7 +234,7 @@ io.on("connection", (socket) => {
           "profile.onlineStatus": false,
           lastSeen: new Date(),
         });
-        await emitOnlinePlayers();
+        await emitOnlinePlayers(); // Emit updated players list after a user disconnects
         console.log(`User offline: ${uid}`);
       } catch (err) {
         console.error("Error updating user status on disconnect:", err);
@@ -247,7 +247,6 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 4000;
 
-// Start server
 (async () => {
   try {
     await connectDb();
@@ -261,7 +260,6 @@ const PORT = process.env.PORT || 4000;
   }
 })();
 
-// Graceful shutdown on SIGINT
 process.on("SIGINT", () => {
   console.log("\nServer shutting down...");
   server.close(() => {
