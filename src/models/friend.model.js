@@ -25,16 +25,16 @@ const FriendRequestSchema = new Schema(
 );
 
 /**
- * ✅ VERY IMPORTANT
- * Prevents duplicate pending requests between same users
- * This is one of the hidden causes of:
- * - "request already exists"
- * - ghost requests
- * - inconsistent UI states
+ * ✅ CRITICAL FIX
+ * Allow only ONE pending request between the same users
+ * but allow re-requests after accept/reject.
  */
 FriendRequestSchema.index(
   { from: 1, to: 1 },
-  { unique: true }
+  {
+    unique: true,
+    partialFilterExpression: { status: "pending" },
+  }
 );
 
 export default mongoose.model("FriendRequest", FriendRequestSchema);

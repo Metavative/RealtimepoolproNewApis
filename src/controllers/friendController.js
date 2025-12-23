@@ -3,6 +3,17 @@ import User from "../models/user.model.js";
 import crypto from "crypto";
 
 /**
+ * Helper: emit to all sockets of a user (room-based)
+ * - user:<id>  (new)
+ * - <id>       (legacy compatibility)
+ */
+function emitToUser(io, userId, event, payload) {
+  const uid = String(userId);
+  io.to(`user:${uid}`).emit(event, payload);
+  io.to(uid).emit(event, payload); // legacy support (your codebase already uses this in places)
+}
+
+/**
  * SEND FRIEND REQUEST
  */
 export async function sendRequest(req, res, io, presence) {
@@ -15,10 +26,14 @@ export async function sendRequest(req, res, io, presence) {
     }
 
     if (String(from) === String(to)) {
-      return res.status(400).json({ message: "You cannot send a request to yourself" });
+      return res
+        .status(400)
+        .json({ message: "You cannot send a request to yourself" });
     }
 
-    const sender = await User.findById(from).select("friends");
+    const sender = await User.findById(from).select(
+      "friends profile.nickname profile.avatar stats.userIdTag"
+    );
     if (!sender) {
       return res.status(404).json({ message: "Sender not found" });
     }
@@ -43,14 +58,29 @@ export async function sendRequest(req, res, io, presence) {
       status: "pending",
     });
 
-    // 🔔 Notify receiver if online
-    const toSocket = presence.get(String(to));
-    if (toSocket) {
-      io.to(toSocket).emit("friend:request:new", {
-        requestId: fr._id,
-        from,
-      });
-    }
+    // ✅ UI-ready payload (Flutter can render instantly)
+    const requestPayload = {
+      id: String(fr._id),
+      fromUserId: String(from),
+      toUserId: String(to),
+      senderName: sender.profile?.nickname || "Unknown",
+      senderAvatar: sender.profile?.avatar || "",
+      senderTag: sender.stats?.userIdTag || "",
+      status: fr.status,
+      createdAt: fr.createdAt || new Date().toISOString(),
+    };
+
+    // ✅ Real-time: notify receiver
+    emitToUser(io, to, "friend:request_received", { request: requestPayload });
+
+    // Optional: notify sender devices (sync UI on multiple devices)
+    emitToUser(io, from, "friend:request_sent", { request: requestPayload });
+
+    // ✅ Compatibility: older event name some clients may still listen to
+    emitToUser(io, to, "friend:request:new", {
+      requestId: String(fr._id),
+      from: String(from),
+    });
 
     return res.json({ success: true, fr });
   } catch (error) {
@@ -94,19 +124,35 @@ export async function respond(req, res, io, presence) {
       await User.findByIdAndUpdate(fr.to, {
         $addToSet: { friends: fr.from },
       });
+
+      // ✅ Specific event for Flutter
+      emitToUser(io, fr.from, "friend:request_accepted", {
+        requestId: String(fr._id),
+        byUserId: String(fr.to),
+      });
+      emitToUser(io, fr.to, "friend:request_accepted", {
+        requestId: String(fr._id),
+        byUserId: String(fr.to),
+      });
+    } else {
+      // ✅ Specific event for Flutter
+      emitToUser(io, fr.from, "friend:request_declined", {
+        requestId: String(fr._id),
+        byUserId: String(fr.to),
+      });
+      emitToUser(io, fr.to, "friend:request_declined", {
+        requestId: String(fr._id),
+        byUserId: String(fr.to),
+      });
     }
 
-    // 🔔 Notify both users if online
-    const fromSocket = presence.get(String(fr.from));
-    const toSocket = presence.get(String(fr.to));
+    // ✅ Compatibility: keep generic updates for existing clients
+    emitToUser(io, fr.from, "friend:request_updated", { fr });
+    emitToUser(io, fr.to, "friend:request_updated", { fr });
 
-    if (fromSocket) {
-      io.to(fromSocket).emit("friend:request:updated", fr);
-    }
-
-    if (toSocket) {
-      io.to(toSocket).emit("friend:request:updated", fr);
-    }
+    // ✅ Compatibility: your OLD naming style used colon segments
+    emitToUser(io, fr.from, "friend:request:updated", fr);
+    emitToUser(io, fr.to, "friend:request:updated", fr);
 
     return res.json({ success: true, fr });
   } catch (error) {
@@ -133,9 +179,7 @@ export async function searchFriends(req, res) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    const friendIds = (currentUser.friends || []).map((f) =>
-      String(f._id)
-    );
+    const friendIds = (currentUser.friends || []).map((f) => String(f._id));
 
     const filter = query
       ? {
@@ -147,9 +191,7 @@ export async function searchFriends(req, res) {
       : {};
 
     const users = await User.find(filter)
-      .select(
-        "profile.nickname profile.avatar profile.onlineStatus stats.userIdTag"
-      )
+      .select("profile.nickname profile.avatar profile.onlineStatus stats.userIdTag")
       .lean();
 
     const requests = await FriendRequest.find({
@@ -169,15 +211,11 @@ export async function searchFriends(req, res) {
           status = "friend";
         } else {
           const sentByMe = requests.find(
-            (r) =>
-              String(r.from) === String(userId) &&
-              String(r.to) === uid
+            (r) => String(r.from) === String(userId) && String(r.to) === uid
           );
 
           const sentToMe = requests.find(
-            (r) =>
-              String(r.to) === String(userId) &&
-              String(r.from) === uid
+            (r) => String(r.to) === String(userId) && String(r.from) === uid
           );
 
           if (sentByMe) {
@@ -212,13 +250,13 @@ export async function searchFriends(req, res) {
 /**
  * DUMMY INCOMING REQUEST (DEV ONLY)
  */
-export async function createDummyIncomingRequest(req, res) {
+export async function createDummyIncomingRequest(req, res, io, presence) {
   try {
     const userId = req.userId;
 
-    let dummyUser = await User.findOne({
-      email: "dummy@poolpro.dev",
-    }).select("_id");
+    let dummyUser = await User.findOne({ email: "dummy@poolpro.dev" }).select(
+      "_id profile.nickname profile.avatar stats.userIdTag"
+    );
 
     if (!dummyUser) {
       const tag = `player_${crypto.randomBytes(3).toString("hex")}`;
@@ -250,6 +288,26 @@ export async function createDummyIncomingRequest(req, res) {
       from: dummyUser._id,
       to: userId,
       status: "pending",
+    });
+
+    const requestPayload = {
+      id: String(fr._id),
+      fromUserId: String(dummyUser._id),
+      toUserId: String(userId),
+      senderName: dummyUser.profile?.nickname || "DummyPlayer",
+      senderAvatar: dummyUser.profile?.avatar || "",
+      senderTag: dummyUser.stats?.userIdTag || "",
+      status: fr.status,
+      createdAt: fr.createdAt || new Date().toISOString(),
+    };
+
+    // ✅ Real-time push so LandingScreen updates instantly
+    emitToUser(io, userId, "friend:request_received", { request: requestPayload });
+
+    // ✅ Compatibility
+    emitToUser(io, userId, "friend:request:new", {
+      requestId: String(fr._id),
+      from: String(dummyUser._id),
     });
 
     return res.json({ success: true, fr });

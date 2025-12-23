@@ -1,11 +1,72 @@
 import User from "../../models/user.model.js";
 
-const DASH = String.fromCharCode(45);
+/**
+ * Multi-socket tracker:
+ * userId -> Set(socketId)
+ */
+const userSockets = new Map();
+
+/**
+ * Backward compatible:
+ * presence.get(userId) should still return ONE socketId if online.
+ */
+function presenceGet(presence, userId) {
+  const uid = String(userId);
+  const val = presence.get(uid);
+
+  if (val instanceof Set) {
+    const arr = Array.from(val);
+    return arr.length ? arr[0] : null;
+  }
+
+  if (typeof val === "string") return val;
+
+  return null;
+}
+
+function addSocket(presence, userId, socketId) {
+  const uid = String(userId);
+
+  if (!userSockets.has(uid)) userSockets.set(uid, new Set());
+  userSockets.get(uid).add(socketId);
+
+  if (!presence.has(uid) || !(presence.get(uid) instanceof Set)) {
+    presence.set(uid, new Set());
+  }
+  presence.get(uid).add(socketId);
+
+  return userSockets.get(uid).size;
+}
+
+function removeSocket(presence, userId, socketId) {
+  const uid = String(userId);
+
+  const set = userSockets.get(uid);
+  if (set) {
+    set.delete(socketId);
+    if (set.size === 0) userSockets.delete(uid);
+  }
+
+  const pset = presence.get(uid);
+  if (pset instanceof Set) {
+    pset.delete(socketId);
+    if (pset.size === 0) presence.delete(uid);
+  } else {
+    if (presence.get(uid) === socketId) presence.delete(uid);
+  }
+
+  return userSockets.get(uid)?.size ?? 0;
+}
+
+function isFirstSocket(userId) {
+  const uid = String(userId);
+  return !userSockets.has(uid) || userSockets.get(uid).size === 0;
+}
 
 // Fetch online users based on presence map
 async function getOnlineUsersFromPresence(presence) {
   const ids = Array.from(presence.keys());
-  if (ids.length === 0) return []; // Fix: check if array is empty
+  if (ids.length === 0) return [];
 
   try {
     const users = await User.find({ _id: { $in: ids } })
@@ -62,6 +123,27 @@ function pickLngLat(location) {
   return { lng, lat };
 }
 
+function normalizePayload(payload) {
+  if (!payload) return { userId: null, location: null };
+
+  // if payload is string => userId only
+  if (typeof payload === "string") {
+    return { userId: payload, location: null };
+  }
+
+  // common formats:
+  // { userId, location: {lng,lat} }
+  // { userId, lng, lat }
+  const userId = payload.userId ?? payload.id ?? payload._id ?? null;
+
+  let location = payload.location ?? null;
+  if (!location && (payload.lng != null || payload.lat != null)) {
+    location = { lng: payload.lng, lat: payload.lat };
+  }
+
+  return { userId, location };
+}
+
 // Register presence event handlers
 export default function registerPresenceHandlers(io, socket, presence) {
   async function identifyUser(userId, location) {
@@ -70,7 +152,17 @@ export default function registerPresenceHandlers(io, socket, presence) {
       return;
     }
 
+    const uid = String(userId);
     const { lng, lat } = pickLngLat(location);
+
+    // ✅ Join rooms for this user (new + legacy)
+    socket.join(`user:${uid}`);
+    socket.join(uid);
+
+    socket.userId = uid;
+
+    const first = isFirstSocket(uid);
+    addSocket(presence, uid, socket.id);
 
     const updateData = {
       "profile.onlineStatus": true,
@@ -84,15 +176,22 @@ export default function registerPresenceHandlers(io, socket, presence) {
     }
 
     try {
-      await User.findByIdAndUpdate(userId, updateData);
-      socket.userId = String(userId);
-      presence.set(String(userId), socket.id);
+      await User.findByIdAndUpdate(uid, updateData);
 
+      // Existing behavior
       const onlineUsers = await getOnlineUsersFromPresence(presence);
       io.emit("presence:update", onlineUsers);
 
+      // Optional standardized events
+      if (first) {
+        io.emit("presence:user_online", { userId: uid });
+      }
+
+      // Useful for Flutter quick init
+      socket.emit("presence:online_list", { userIds: Array.from(presence.keys()) });
+
       if (lng !== null && lat !== null) {
-        const nearbyPlayers = await getNearbyPlayersByCoords(String(userId), lng, lat);
+        const nearbyPlayers = await getNearbyPlayersByCoords(uid, lng, lat);
         socket.emit("nearbyPlayers", nearbyPlayers);
       }
     } catch (error) {
@@ -106,27 +205,30 @@ export default function registerPresenceHandlers(io, socket, presence) {
       return;
     }
 
+    const uid = String(userId);
     const { lng, lat } = pickLngLat(location);
     if (lng === null || lat === null) return;
 
     try {
-      await User.findByIdAndUpdate(String(userId), {
+      await User.findByIdAndUpdate(uid, {
         location: { type: "Point", coordinates: [lng, lat] },
         "profile.longitude": lng,
         "profile.latitude": lat,
         lastSeen: new Date(),
       });
 
-      const nearbyPlayers = await getNearbyPlayersByCoords(String(userId), lng, lat);
+      const nearbyPlayers = await getNearbyPlayersByCoords(uid, lng, lat);
       socket.emit("nearbyPlayers", nearbyPlayers);
     } catch (error) {
       console.error("Error moving user:", error);
     }
   }
 
+  // --- Aliases kept (plus safer normalization) ---
   socket.on("user:identify", async (payload) => {
     try {
-      await identifyUser(payload?.userId, payload?.location);
+      const p = normalizePayload(payload);
+      await identifyUser(p.userId, p.location);
     } catch (e) {
       console.error("user:identify error", e);
     }
@@ -134,7 +236,8 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("identify", async (payload) => {
     try {
-      await identifyUser(payload?.userId, payload?.location);
+      const p = normalizePayload(payload);
+      await identifyUser(p.userId, p.location);
     } catch (e) {
       console.error("identify error", e);
     }
@@ -142,7 +245,8 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("player:online", async (payload) => {
     try {
-      await identifyUser(payload?.userId, payload?.location);
+      const p = normalizePayload(payload);
+      await identifyUser(p.userId, p.location);
     } catch (e) {
       console.error("player:online error", e);
     }
@@ -150,8 +254,8 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("userOnline", async (payload) => {
     try {
-      const id = typeof payload === "string" ? payload : payload?.userId;
-      await identifyUser(id, payload?.location);
+      const p = normalizePayload(payload);
+      await identifyUser(p.userId, p.location);
     } catch (e) {
       console.error("userOnline error", e);
     }
@@ -159,7 +263,8 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("user:move", async (payload) => {
     try {
-      await moveUser(payload?.userId, payload?.location);
+      const p = normalizePayload(payload);
+      await moveUser(p.userId, p.location);
     } catch (e) {
       console.error("user:move error", e);
     }
@@ -167,8 +272,8 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("updateLocation", async (payload) => {
     try {
-      const loc = { lng: payload?.lng, lat: payload?.lat };
-      await moveUser(payload?.userId, loc);
+      const p = normalizePayload(payload);
+      await moveUser(p.userId, p.location);
     } catch (e) {
       console.error("updateLocation error", e);
     }
@@ -176,9 +281,25 @@ export default function registerPresenceHandlers(io, socket, presence) {
 
   socket.on("player:move", async (payload) => {
     try {
-      await moveUser(payload?.userId, payload?.location);
+      const p = normalizePayload(payload);
+      await moveUser(p.userId, p.location);
     } catch (e) {
       console.error("player:move error", e);
+    }
+  });
+
+  // Optional presence utility
+  socket.on("presence:check", ({ userIds }) => {
+    try {
+      const status = {};
+      (userIds || []).forEach((id) => {
+        const uid = String(id);
+        const val = presence.get(uid);
+        status[uid] = val instanceof Set ? val.size > 0 : Boolean(val);
+      });
+      socket.emit("presence:status", { status });
+    } catch (e) {
+      console.error("presence:check error", e);
     }
   });
 
@@ -186,17 +307,24 @@ export default function registerPresenceHandlers(io, socket, presence) {
     try {
       if (!socket.userId) return;
 
-      presence.delete(String(socket.userId));
+      const uid = String(socket.userId);
+      const remaining = removeSocket(presence, uid, socket.id);
 
-      await User.findByIdAndUpdate(String(socket.userId), {
-        "profile.onlineStatus": false,
-        lastSeen: new Date(),
-      });
+      if (remaining === 0) {
+        await User.findByIdAndUpdate(uid, {
+          "profile.onlineStatus": false,
+          lastSeen: new Date(),
+        });
 
-      const onlineUsers = await getOnlineUsersFromPresence(presence);
-      io.emit("presence:update", onlineUsers);
+        const onlineUsers = await getOnlineUsersFromPresence(presence);
+        io.emit("presence:update", onlineUsers);
+
+        io.emit("presence:user_offline", { userId: uid });
+      }
     } catch (e) {
       console.error("disconnect presence error", e);
     }
   });
 }
+
+export { presenceGet };

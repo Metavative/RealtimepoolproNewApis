@@ -21,7 +21,10 @@ import zegoRoutes from "./routes/zego.route.js";
 import friendRoutesFactory from "./routes/friend.route.js";
 
 import registerMatchHandlers from "./services/socket_handler/matchHandler.js";
-import registerPresenceHandlers from "./services/socket_handler/presenceHandler.js";
+import registerPresenceHandlers, {
+  // this export exists in the updated presenceHandler I gave you
+  presenceGet,
+} from "./services/socket_handler/presenceHandler.js";
 
 dotenv.config();
 
@@ -67,7 +70,23 @@ const io = new Server(server, {
 });
 
 // ✅ Presence map (single source of truth)
+// With updated presenceHandler, presence values become Set(socketIds)
 const presence = new Map();
+
+/**
+ * Helper: online check that works for:
+ * - presence value = string socketId (legacy)
+ * - presence value = Set(socketIds)  (multi-device)
+ */
+function isOnline(presenceMap, userId) {
+  const uid = String(userId);
+  if (!presenceMap.has(uid)) return false;
+
+  const val = presenceMap.get(uid);
+  if (val instanceof Set) return val.size > 0;
+  if (typeof val === "string") return val.length > 0;
+  return false;
+}
 
 // Routes (normal)
 app.use("/api/auth", authRoutes);
@@ -80,10 +99,10 @@ app.use("/api/zego", zegoRoutes);
 app.use("/api/friend", friendRoutesFactory(io, presence));
 app.use("/api/match", matchRoutesFactory(io, presence));
 
-// User status endpoint
+// User status endpoint (updated: multi-device safe)
 app.get("/api/user/status/:id", (req, res) => {
   const { id } = req.params;
-  res.json({ userId: String(id), online: presence.has(String(id)) });
+  res.json({ userId: String(id), online: isOnline(presence, id) });
 });
 
 // Health check
@@ -101,6 +120,7 @@ io.on("connection", (socket) => {
   console.log(`Socket connected: ${socket.id}`);
 
   // Presence system (emits presence:update + nearbyPlayers)
+  // (updated presenceHandler makes it multi-device safe + joins rooms)
   registerPresenceHandlers(io, socket, presence);
 
   // Match socket handlers (if you use any socket-only match flows)
