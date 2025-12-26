@@ -1,104 +1,80 @@
-function getSocketIdFromPresence(presence, userId) {
-  if (!presence) return null;
-  if (!userId) return null;
-  return presence.get(String(userId)) || null;
+/**
+ * Match handler using rooms
+ * Sends to rooms:
+ * user:<id>
+ * <id>
+ */
+
+function emitToUser(io, userId, event, payload) {
+  if (!io || !userId) return;
+  const uid = String(userId);
+  io.to(`user:${uid}`).emit(event, payload);
+  io.to(uid).emit(event, payload);
 }
 
-/**
- * Match challenge real-time events
- * @param {import("socket.io").Server} io
- * @param {import("socket.io").Socket} socket
- * @param {Map<string,string>} presence
- */
-export default function registerMatchHandlers(io, socket, presence) {
-  // 1) challenge sent (server forwards to opponent)
-  socket.on("match:challenge_sent", async (payload) => {
+export default function matchHandler(io, socket, presence) {
+  socket.on("match:challenge_sent", (payload) => {
     try {
-      const { opponentId, matchId, entryFee, challengerInfo } = payload;
+      const { opponentId, matchId, entryFee, challengerInfo } = payload || {};
 
       if (!opponentId || !matchId) {
-        console.error("Invalid payload: missing opponentId or matchId".red);
+        console.log("match:challenge_sent invalid payload", payload);
         return;
       }
 
-      const opponentSocketId = getSocketIdFromPresence(presence, opponentId);
-      if (!opponentSocketId) {
-        console.warn(`Opponent ${opponentId} not online, challenge cannot be sent.`.yellow);
-        return;
-      }
-
-      console.log(`Challenge sent from ${challengerInfo?.nickname} to ${opponentId}`.green);
-
-      io.to(opponentSocketId).emit("match:challenge_received", {
+      emitToUser(io, opponentId, "challenge:received", {
         matchId,
-        entryFee,
-        challengerInfo,
+        entryFee: entryFee || 0,
+        opponentId: String(opponentId),
+        challengerInfo: challengerInfo || {},
         timestamp: Date.now(),
       });
-    } catch (error) {
-      console.error("match:challenge_sent error", error?.message || error);
+
+      console.log("challenge forwarded", opponentId, String(matchId));
+    } catch (e) {
+      console.log("match:challenge_sent error", e?.message || e);
     }
   });
 
-  // 2) challenge accepted (server forwards to challenger)
-  socket.on("match:challenge_accepted", async (payload) => {
+  socket.on("match:challenge_accepted", (payload) => {
     try {
-      const { challengerId, matchId } = payload;
+      const { challengerId, matchId } = payload || {};
 
       if (!challengerId || !matchId) {
-        console.error("Invalid payload: missing challengerId or matchId".red);
+        console.log("match:challenge_accepted invalid payload", payload);
         return;
       }
 
-      const challengerSocketId = getSocketIdFromPresence(presence, challengerId);
-      if (!challengerSocketId) {
-        console.warn(`Challenger ${challengerId} not online, cannot notify acceptance.`.yellow);
-        return;
-      }
-
-      console.log(`Challenge accepted for match ${matchId}, notifying ${challengerId}`.green);
-
-      io.to(challengerSocketId).emit("match:started", {
+      emitToUser(io, challengerId, "match:started", {
         matchId,
-        message: "Your challenge has been accepted. Starting match.",
+        message: "Challenge accepted",
+        timestamp: Date.now(),
       });
-    } catch (error) {
-      console.error("match:challenge_accepted error", error?.message || error);
+
+      console.log("challenge accepted notify", challengerId, String(matchId));
+    } catch (e) {
+      console.log("match:challenge_accepted error", e?.message || e);
     }
   });
 
-  // 3) match completed (server notifies both players)
-  socket.on("match:completed_notification", async (payload) => {
+  socket.on("match:challenge_declined", (payload) => {
     try {
-      const { players, matchId, winnerId } = payload;
+      const { challengerId, matchId } = payload || {};
 
-      if (!matchId || !Array.isArray(players) || players.length === 0) {
-        console.error("Invalid payload: missing matchId or players array".red);
+      if (!challengerId || !matchId) {
+        console.log("match:challenge_declined invalid payload", payload);
         return;
       }
 
-      console.log(`Match ${matchId} completed, notifying players.`.green);
+      emitToUser(io, challengerId, "match:declined", {
+        matchId,
+        message: "Challenge declined",
+        timestamp: Date.now(),
+      });
 
-      for (const userId of players) {
-        const targetSocketId = getSocketIdFromPresence(presence, userId);
-        if (!targetSocketId) {
-          console.warn(`Player ${userId} not online, cannot send match result.`.yellow);
-          continue;
-        }
-
-        const message =
-          String(winnerId) === String(userId)
-            ? "Congratulations! You won the match."
-            : "You lost the match. Better luck next time.";
-
-        io.to(targetSocketId).emit("match:result", {
-          matchId,
-          winnerId,
-          message,
-        });
-      }
-    } catch (error) {
-      console.error("match:completed_notification error", error?.message || error);
+      console.log("challenge declined notify", challengerId, String(matchId));
+    } catch (e) {
+      console.log("match:challenge_declined error", e?.message || e);
     }
   });
 }

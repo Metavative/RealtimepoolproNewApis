@@ -3,20 +3,19 @@ import User from "./../models/user.model.js";
 import Transaction from "./../models/transaction.model.js";
 import mongoose from "mongoose";
 
-// Commission Rate: App ka apna commission (e.g., 10%)
-const APP_COMMISSION_RATE = 0.10; // 10% commission
+const APP_COMMISSION_RATE = 0.10;
 
-// Helper: emit to a user if online
-function emitToUser(io, presence, userId, event, payload) {
-  if (!io || !presence || !userId) return;
-  const socketId = presence.get(String(userId));
-  if (socketId) io.to(socketId).emit(event, payload);
+// ✅ Room based emit (matches your friend controller)
+function emitToUser(io, userId, event, payload) {
+  if (!io || !userId) return;
+  const uid = String(userId);
+  io.to(`user:${uid}`).emit(event, payload);
+  io.to(uid).emit(event, payload); // legacy support
 }
 
 // ========================
 // 1. CREATE CHALLENGE
 // ========================
-// UPDATED SIGNATURE: (req, res, io, presence)
 export async function createChallenge(req, res, io, presence) {
   try {
     const { opponentId, entryFee, clubId, slot } = req.body;
@@ -26,7 +25,6 @@ export async function createChallenge(req, res, io, presence) {
       return res.status(400).json({ message: "opponentId is required" });
     }
 
-    // ✅ MatchSchema mein 'players' array mein object IDs chahiye
     const match = await Match.create({
       players: [challenger, opponentId],
       status: "pending",
@@ -34,7 +32,6 @@ export async function createChallenge(req, res, io, presence) {
       meta: { clubId, slot },
     });
 
-    // ✅ Fetch challenger info for UI popup
     const challengerUser = await User.findById(challenger)
       .select("profile.nickname profile.avatar stats.userIdTag")
       .lean();
@@ -49,11 +46,11 @@ export async function createChallenge(req, res, io, presence) {
         avatar: challengerUser?.profile?.avatar || "",
         userIdTag: challengerUser?.stats?.userIdTag || "",
       },
-      match: match, // optional: if you want full match doc
+      match, // optional
     };
 
-    // ✅ Realtime notify opponent if online
-    emitToUser(io, presence, opponentId, "challenge:received", payload);
+    // ✅ Realtime notify opponent (room based)
+    emitToUser(io, opponentId, "challenge:received", payload);
 
     return res.json({ match });
   } catch (error) {
@@ -64,7 +61,6 @@ export async function createChallenge(req, res, io, presence) {
 // ========================
 // 2. ACCEPT CHALLENGE
 // ========================
-// UPDATED SIGNATURE: (req, res, io, presence)
 export async function acceptChallenge(req, res, io, presence) {
   try {
     const { matchId } = req.body;
@@ -73,17 +69,19 @@ export async function acceptChallenge(req, res, io, presence) {
     const match = await Match.findById(matchId);
     if (!match) return res.status(404).json({ message: "Match not found" });
 
-    // Only players can accept
-    const isPlayer = match.players?.some((p) => String(p) === String(accepterId));
+    const isPlayer = match.players?.some(
+      (p) => String(p) === String(accepterId)
+    );
     if (!isPlayer) {
-      return res.status(403).json({ message: "Not authorized to accept this match" });
+      return res
+        .status(403)
+        .json({ message: "Not authorized to accept this match" });
     }
 
     match.status = "ongoing";
     match.startAt = new Date();
     await match.save();
 
-    // ✅ Notify BOTH players match started
     const payload = {
       matchId: match._id,
       status: match.status,
@@ -92,8 +90,9 @@ export async function acceptChallenge(req, res, io, presence) {
       entryFee: match.entryFee || 0,
     };
 
+    // ✅ Notify BOTH players match started (room based)
     for (const playerId of match.players) {
-      emitToUser(io, presence, playerId, "match:started", payload);
+      emitToUser(io, playerId, "match:started", payload);
     }
 
     return res.json({ match });
@@ -103,9 +102,8 @@ export async function acceptChallenge(req, res, io, presence) {
 }
 
 // ========================
-// 3. FINISH MATCH (CRITICAL LOGIC ADDED)
+// 3. FINISH MATCH
 // ========================
-// UPDATED SIGNATURE: (req, res, io, presence)
 export async function finishMatch(req, res, io, presence) {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -124,7 +122,7 @@ export async function finishMatch(req, res, io, presence) {
       return res.status(400).json({ message: "Match is not ongoing." });
     }
 
-    const loserId = match.players.find((p) => p.toString() !== winnerId);
+    const loserId = match.players.find((p) => p.toString() !== String(winnerId));
     if (!loserId) {
       await session.abortTransaction();
       return res.status(400).json({ message: "Invalid winner or players." });
@@ -135,14 +133,12 @@ export async function finishMatch(req, res, io, presence) {
     const appCommission = totalWager * APP_COMMISSION_RATE;
     const payoutAmount = totalWager - appCommission;
 
-    // 1. Match update
     match.status = "finished";
     match.endAt = new Date();
     match.winner = winnerId;
     match.score = scores;
     await match.save({ session });
 
-    // 2. User stats update
     const winnerUpdate = {
       $inc: {
         "earnings.availableBalance": payoutAmount,
@@ -161,7 +157,6 @@ export async function finishMatch(req, res, io, presence) {
     await User.findByIdAndUpdate(winnerId, winnerUpdate, { session });
     await User.findByIdAndUpdate(loserId, loserUpdate, { session });
 
-    // 3. Transactions
     await Transaction.create(
       [
         {
@@ -191,7 +186,6 @@ export async function finishMatch(req, res, io, presence) {
     await session.commitTransaction();
     session.endSession();
 
-    // ✅ Notify BOTH players match finished/result
     const payload = {
       matchId: match._id,
       status: match.status,
@@ -202,9 +196,10 @@ export async function finishMatch(req, res, io, presence) {
       scores: scores || null,
     };
 
+    // ✅ Notify BOTH players (room based)
     for (const playerId of match.players) {
-      emitToUser(io, presence, playerId, "match:finished", payload);
-      emitToUser(io, presence, playerId, "match:result", payload); // optional alias if frontend uses it
+      emitToUser(io, playerId, "match:finished", payload);
+      emitToUser(io, playerId, "match:result", payload);
     }
 
     return res.json({
@@ -225,7 +220,6 @@ export async function finishMatch(req, res, io, presence) {
 // ========================
 // 4. CANCEL MATCH
 // ========================
-// NOTE: Cancel currently does not emit. You can add "match:cancelled" same way if needed.
 export async function cancelMatch(req, res) {
   const session = await mongoose.startSession();
   session.startTransaction();
