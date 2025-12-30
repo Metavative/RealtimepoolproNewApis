@@ -4,32 +4,8 @@ import User from "../../models/user.model.js";
 /**
  * Multi-socket tracker:
  * userId -> Set(socketId)
- * So a user remains "online" until ALL their devices disconnect.
  */
 const userSockets = new Map();
-
-/**
- * Calculate nearest online players using GeoJSON query
- */
-async function getNearbyPlayers(userId, radiusKm = 5) {
-  const user = await User.findById(userId);
-  if (!user || !user.location?.coordinates) return [];
-
-  const [lng, lat] = user.location.coordinates;
-
-  return User.find({
-    _id: { $ne: userId },
-    "profile.onlineStatus": true,
-    location: {
-      $near: {
-        $geometry: { type: "Point", coordinates: [lng, lat] },
-        $maxDistance: radiusKm * 1000, // meters
-      },
-    },
-  }).select(
-    "profile.nickname profile.avatar stats.totalWinnings profile.verified location"
-  );
-}
 
 function addSocket(userId, socketId) {
   const uid = String(userId);
@@ -60,32 +36,77 @@ function isFirstSocket(userId) {
 function emitToUser(io, userId, event, payload) {
   const uid = String(userId);
   io.to(`user:${uid}`).emit(event, payload);
-  io.to(uid).emit(event, payload); // legacy support
+  io.to(uid).emit(event, payload);
 }
 
 /**
- * Register Socket.IO logic for live online + nearby player syncing
+ * Server-side cache bust helper
+ * (lets client add ?cb=<value>)
  */
-export default function registerOnlinePlayerHandlers(io, socket) {
-  // Player connects / goes online
-  socket.on("player:online", async ({ userId, location, radiusKm }) => {
-    try {
-      if (!userId || !location) return;
+function decoratePlayers(list) {
+  const bust = Date.now();
+  return (list || []).map((u) => {
+    const obj = u?.toObject ? u.toObject() : u;
+    return { ...obj, __avatarBust: bust };
+  });
+}
 
-      const uid = String(userId);
+/**
+ * Calculate nearest online players using GeoJSON query
+ */
+async function getNearbyPlayers(userId, radiusKm = 5) {
+  const user = await User.findById(userId);
+  if (!user || !user.location?.coordinates) return [];
 
-      // Join rooms for this user (supports both new + existing emits)
-      socket.join(`user:${uid}`);
-      socket.join(uid);
+  const [lng, lat] = user.location.coordinates;
 
-      // Mark socket userId
-      socket.userId = uid;
+  return User.find({
+    _id: { $ne: userId },
+    "profile.onlineStatus": true,
+    location: {
+      $near: {
+        $geometry: { type: "Point", coordinates: [lng, lat] },
+        $maxDistance: radiusKm * 1000,
+      },
+    },
+  }).select(
+    // ✅ include avatarUpdatedAt + updatedAt so client can cache-bust properly
+    "profile.nickname profile.avatar profile.avatarUpdatedAt profile.verified stats.totalWinnings location updatedAt"
+  );
+}
 
-      const first = isFirstSocket(uid);
-      addSocket(uid, socket.id);
+/**
+ * Get all online players (simple list)
+ */
+async function getOnlinePlayersList(userId) {
+  return User.find({
+    _id: { $ne: userId },
+    "profile.onlineStatus": true,
+  }).select(
+    "profile.nickname profile.avatar profile.avatarUpdatedAt profile.verified stats.totalWinnings location updatedAt"
+  );
+}
 
-      // Update DB only once per user session start (optional but good)
-      // Still updates location/lastSeen every time.
+/**
+ * Unified handler: "user went online / identify"
+ */
+async function handleOnline(io, socket, { userId, location, radiusKm }) {
+  try {
+    if (!userId) return;
+
+    const uid = String(userId);
+
+    // Join rooms
+    socket.join(`user:${uid}`);
+    socket.join(uid);
+
+    socket.userId = uid;
+
+    const first = isFirstSocket(uid);
+    addSocket(uid, socket.id);
+
+    // Update DB
+    if (location?.lng != null && location?.lat != null) {
       await User.findByIdAndUpdate(uid, {
         "profile.onlineStatus": true,
         location: {
@@ -94,54 +115,101 @@ export default function registerOnlinePlayerHandlers(io, socket) {
         },
         lastSeen: new Date(),
       });
-
-      // Emit nearby players list to this socket
-      const nearbyPlayers = await getNearbyPlayers(uid, radiusKm ?? 5);
-      socket.emit("nearbyPlayers", nearbyPlayers);
-
-      // Notify nearby players that this user is nearby/online
-      for (const player of nearbyPlayers) {
-        emitToUser(io, player._id, "playerNearby", {
-          userId: uid,
-          nickname: undefined, // keep payload minimal; if you want, fetch current user nickname
-          avatar: undefined,
-          location,
-        });
-      }
-
-      // Optional: global presence signal (only on first socket)
-      if (first) {
-        io.emit("presence:user_online", { userId: uid });
-      }
-    } catch (err) {
-      // silent fail to avoid crashing socket loop
-      console.error("player:online error:", err);
-    }
-  });
-
-  // Player moves (live update)
-  socket.on("player:move", async ({ userId, location, radiusKm }) => {
-    try {
-      if (!userId || !location) return;
-
-      const uid = String(userId);
-
+    } else {
       await User.findByIdAndUpdate(uid, {
-        location: {
-          type: "Point",
-          coordinates: [location.lng, location.lat],
-        },
+        "profile.onlineStatus": true,
         lastSeen: new Date(),
       });
-
-      const nearbyPlayers = await getNearbyPlayers(uid, radiusKm ?? 5);
-      socket.emit("nearbyPlayers", nearbyPlayers);
-    } catch (err) {
-      console.error("player:move error:", err);
     }
-  });
 
-  // Player disconnects
+    // Emit nearby + online lists to this socket
+    const nearbyPlayers = await getNearbyPlayers(uid, radiusKm ?? 5);
+    socket.emit("nearbyPlayers", decoratePlayers(nearbyPlayers));
+
+    const onlinePlayers = await getOnlinePlayersList(uid);
+    socket.emit("onlinePlayers", decoratePlayers(onlinePlayers));
+
+    // Optional: global presence signal (only on first socket)
+    if (first) {
+      io.emit("presence:user_online", { userId: uid });
+    }
+  } catch (err) {
+    console.error("handleOnline error:", err);
+  }
+}
+
+/**
+ * Unified handler: "user moved"
+ */
+async function handleMove(io, socket, { userId, location, radiusKm }) {
+  try {
+    if (!userId || !location) return;
+
+    const uid = String(userId);
+
+    await User.findByIdAndUpdate(uid, {
+      location: {
+        type: "Point",
+        coordinates: [location.lng, location.lat],
+      },
+      lastSeen: new Date(),
+    });
+
+    const nearbyPlayers = await getNearbyPlayers(uid, radiusKm ?? 5);
+    socket.emit("nearbyPlayers", decoratePlayers(nearbyPlayers));
+
+    const onlinePlayers = await getOnlinePlayersList(uid);
+    socket.emit("onlinePlayers", decoratePlayers(onlinePlayers));
+  } catch (err) {
+    console.error("handleMove error:", err);
+  }
+}
+
+/**
+ * Register Socket.IO logic
+ */
+export default function registerOnlinePlayerHandlers(io, socket) {
+  // ✅ Original events (keep)
+  socket.on("player:online", (payload) => handleOnline(io, socket, payload));
+  socket.on("player:move", (payload) => handleMove(io, socket, payload));
+
+  // ✅ Flutter aliases (your app emits these)
+  socket.on("userOnline", ({ userId }) => handleOnline(io, socket, { userId }));
+  socket.on("user:identify", ({ userId, location }) =>
+    handleOnline(io, socket, { userId, location })
+  );
+
+  socket.on("updateLocation", ({ userId, lng, lat }) =>
+    handleMove(io, socket, {
+      userId,
+      location: { lng, lat },
+    })
+  );
+
+  // ✅ Presence list request events (your app emits many)
+  const presenceResponder = async () => {
+    try {
+      const uid = String(socket.userId || "");
+      if (!uid) return;
+
+      const nearbyPlayers = await getNearbyPlayers(uid, 5);
+      socket.emit("nearbyPlayers", decoratePlayers(nearbyPlayers));
+
+      const onlinePlayers = await getOnlinePlayersList(uid);
+      socket.emit("onlinePlayers", decoratePlayers(onlinePlayers));
+    } catch (err) {
+      console.error("presenceResponder error:", err);
+    }
+  };
+
+  socket.on("presence:get", presenceResponder);
+  socket.on("getOnlinePlayers", presenceResponder);
+  socket.on("onlinePlayers:get", presenceResponder);
+  socket.on("players:online:get", presenceResponder);
+  socket.on("nearbyPlayers:get", presenceResponder);
+  socket.on("players:nearby:get", presenceResponder);
+
+  // Disconnect
   socket.on("disconnect", async () => {
     try {
       if (!socket.userId) return;
@@ -149,17 +217,13 @@ export default function registerOnlinePlayerHandlers(io, socket) {
       const uid = String(socket.userId);
       const remaining = removeSocket(uid, socket.id);
 
-      // Only mark offline when last device disconnects
       if (remaining === 0) {
         await User.findByIdAndUpdate(uid, {
           "profile.onlineStatus": false,
           lastSeen: new Date(),
         });
 
-        // Keep your existing event
         io.emit("playerOffline", uid);
-
-        // Also emit standardized presence event
         io.emit("presence:user_offline", { userId: uid });
       }
     } catch (err) {
