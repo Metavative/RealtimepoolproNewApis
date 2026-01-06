@@ -1,3 +1,4 @@
+// controllers/matchController.js
 import Match from "./../models/match.model.js";
 import User from "./../models/user.model.js";
 import Transaction from "./../models/transaction.model.js";
@@ -5,12 +6,85 @@ import mongoose from "mongoose";
 
 const APP_COMMISSION_RATE = 0.10;
 
-// ✅ Room based emit (matches your friend controller)
 function emitToUser(io, userId, event, payload) {
   if (!io || !userId) return;
   const uid = String(userId);
   io.to(`user:${uid}`).emit(event, payload);
-  io.to(uid).emit(event, payload); // legacy support
+  io.to(uid).emit(event, payload);
+}
+
+function s(v) {
+  return v === null || v === undefined ? "" : String(v).trim();
+}
+
+function asNum(v, fallback = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return n;
+}
+
+function normalizeScoreArray(scores) {
+  // Accept:
+  // - [{ userId, score }]
+  // - [{ user, points }]
+  // - [{ userId, points }]
+  const arr = Array.isArray(scores) ? scores : [];
+  const out = [];
+
+  for (const item of arr) {
+    if (!item) continue;
+
+    const user =
+      item.user ||
+      item.userId ||
+      item._id ||
+      item.id;
+
+    const points =
+      item.points ??
+      item.score ??
+      item.value;
+
+    const uid = s(user);
+    if (!uid) continue;
+
+    // Match schema expects:
+    // { user: ObjectId, points: Number }
+    out.push({
+      user: uid,
+      points: Math.max(0, Math.min(999, Math.round(asNum(points, 0)))),
+    });
+  }
+
+  // de-dupe by user (last wins)
+  const map = new Map();
+  for (const row of out) map.set(String(row.user), row.points);
+
+  const deduped = [];
+  for (const [userId, points] of map.entries()) {
+    deduped.push({ user: userId, points });
+  }
+
+  return deduped;
+}
+
+async function loadUserCard(userId) {
+  const u = await User.findById(userId)
+    .select("profile.nickname profile.avatar profile.avatarUpdatedAt stats.userIdTag stats.rank stats.level stats.totalWinnings")
+    .lean();
+
+  const nickname = s(u?.profile?.nickname);
+  const userIdTag = s(u?.stats?.userIdTag);
+
+  return {
+    userId: s(userId),
+    nickname: nickname || userIdTag || "", // ✅ never "Player"
+    avatar: s(u?.profile?.avatar),
+    avatarUpdatedAt: u?.profile?.avatarUpdatedAt || u?.profile?.updatedAt || u?.updatedAt || null,
+    userIdTag,
+    rank: s(u?.stats?.rank || u?.stats?.level || ""),
+    totalWinnings: asNum(u?.stats?.totalWinnings, 0),
+  };
 }
 
 // ========================
@@ -32,24 +106,17 @@ export async function createChallenge(req, res, io, presence) {
       meta: { clubId, slot },
     });
 
-    const challengerUser = await User.findById(challenger)
-      .select("profile.nickname profile.avatar stats.userIdTag")
-      .lean();
+    const challengerInfo = await loadUserCard(challenger);
 
     const payload = {
       matchId: match._id,
       entryFee: match.entryFee || 0,
-      challengerId: challenger,
-      opponentId,
-      challengerInfo: {
-        nickname: challengerUser?.profile?.nickname || "Player",
-        avatar: challengerUser?.profile?.avatar || "",
-        userIdTag: challengerUser?.stats?.userIdTag || "",
-      },
-      match, // optional
+      challengerId: s(challenger),
+      opponentId: s(opponentId),
+      challengerInfo,
+      timestamp: Date.now(),
     };
 
-    // ✅ Realtime notify opponent (room based)
     emitToUser(io, opponentId, "challenge:received", payload);
 
     return res.json({ match });
@@ -69,18 +136,22 @@ export async function acceptChallenge(req, res, io, presence) {
     const match = await Match.findById(matchId);
     if (!match) return res.status(404).json({ message: "Match not found" });
 
-    const isPlayer = match.players?.some(
-      (p) => String(p) === String(accepterId)
-    );
+    const isPlayer = match.players?.some((p) => String(p) === String(accepterId));
     if (!isPlayer) {
-      return res
-        .status(403)
-        .json({ message: "Not authorized to accept this match" });
+      return res.status(403).json({ message: "Not authorized to accept this match" });
     }
 
     match.status = "ongoing";
+    match.isLive = true;
     match.startAt = new Date();
     await match.save();
+
+    // ✅ send full info so client never has to guess opponent avatar/name
+    const p0 = String(match.players[0]);
+    const p1 = String(match.players[1]);
+
+    const p0Info = await loadUserCard(p0);
+    const p1Info = await loadUserCard(p1);
 
     const payload = {
       matchId: match._id,
@@ -88,14 +159,16 @@ export async function acceptChallenge(req, res, io, presence) {
       startAt: match.startAt,
       players: match.players,
       entryFee: match.entryFee || 0,
+      challengerInfo: p0Info,
+      opponentInfo: p1Info,
+      timestamp: Date.now(),
     };
 
-    // ✅ Notify BOTH players match started (room based)
     for (const playerId of match.players) {
       emitToUser(io, playerId, "match:started", payload);
     }
 
-    return res.json({ match });
+    return res.json({ match, payload });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -117,26 +190,54 @@ export async function finishMatch(req, res, io, presence) {
       return res.status(404).json({ message: "Match not found" });
     }
 
+    // ✅ idempotent: already finished
+    if (match.status === "finished") {
+      await session.abortTransaction();
+      session.endSession();
+      return res.json({ ok: true, alreadyFinished: true, match });
+    }
+
     if (match.status !== "ongoing") {
       await session.abortTransaction();
       return res.status(400).json({ message: "Match is not ongoing." });
     }
 
-    const loserId = match.players.find((p) => p.toString() !== String(winnerId));
+    const winner = s(winnerId);
+    if (!winner) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "winnerId is required." });
+    }
+
+    const loserId = match.players.find((p) => p.toString() !== String(winner));
     if (!loserId) {
       await session.abortTransaction();
       return res.status(400).json({ message: "Invalid winner or players." });
     }
 
-    const entryFee = match.entryFee;
+    const normalizedScores = normalizeScoreArray(scores).map((row) => ({
+      user: new mongoose.Types.ObjectId(String(row.user)),
+      points: row.points,
+    }));
+
+    const entryFee = Number(match.entryFee || 0);
     const totalWager = entryFee * 2;
     const appCommission = totalWager * APP_COMMISSION_RATE;
     const payoutAmount = totalWager - appCommission;
 
     match.status = "finished";
+    match.isLive = false;
     match.endAt = new Date();
-    match.winner = winnerId;
-    match.score = scores;
+    match.winner = winner;
+    match.score = normalizedScores;
+
+    match.meta = {
+      ...(match.meta || {}),
+      finishedAt: Date.now(),
+      finishSource: "http",
+      lastScoreUpdateAt: Date.now(),
+      lastConfirmedBy: s(req.userId),
+    };
+
     await match.save({ session });
 
     const winnerUpdate = {
@@ -154,13 +255,13 @@ export async function finishMatch(req, res, io, presence) {
       },
     };
 
-    await User.findByIdAndUpdate(winnerId, winnerUpdate, { session });
+    await User.findByIdAndUpdate(winner, winnerUpdate, { session });
     await User.findByIdAndUpdate(loserId, loserUpdate, { session });
 
     await Transaction.create(
       [
         {
-          user: winnerId,
+          user: winner,
           amount: payoutAmount,
           type: "payout",
           status: "completed",
@@ -173,7 +274,7 @@ export async function finishMatch(req, res, io, presence) {
     await Transaction.create(
       [
         {
-          user: winnerId,
+          user: winner,
           amount: appCommission,
           type: "debit",
           status: "completed",
@@ -189,20 +290,24 @@ export async function finishMatch(req, res, io, presence) {
     const payload = {
       matchId: match._id,
       status: match.status,
-      winnerId,
+      winnerId: winner,
       loserId: String(loserId),
       payout: payoutAmount,
       commission: appCommission,
-      scores: scores || null,
+      scores: normalizedScores.map((x) => ({
+        userId: String(x.user),
+        score: x.points,
+      })),
+      timestamp: Date.now(),
     };
 
-    // ✅ Notify BOTH players (room based)
     for (const playerId of match.players) {
       emitToUser(io, playerId, "match:finished", payload);
       emitToUser(io, playerId, "match:result", payload);
     }
 
     return res.json({
+      ok: true,
       message: "Match finished and funds settled successfully",
       match,
       payout: payoutAmount,
@@ -218,7 +323,7 @@ export async function finishMatch(req, res, io, presence) {
 }
 
 // ========================
-// 4. CANCEL MATCH
+// 4. CANCEL MATCH (unchanged)
 // ========================
 export async function cancelMatch(req, res) {
   const session = await mongoose.startSession();
@@ -234,9 +339,10 @@ export async function cancelMatch(req, res) {
     }
 
     match.status = "cancelled";
+    match.isLive = false;
     await match.save({ session });
 
-    const entryFee = match.entryFee;
+    const entryFee = Number(match.entryFee || 0);
     if (entryFee > 0) {
       for (const playerId of match.players) {
         await User.findByIdAndUpdate(
@@ -263,7 +369,7 @@ export async function cancelMatch(req, res) {
     await session.commitTransaction();
     session.endSession();
 
-    return res.json({ message: "Match cancelled and funds refunded", match });
+    return res.json({ ok: true, message: "Match cancelled and funds refunded", match });
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
